@@ -13,32 +13,6 @@ local LocalPlayer = Players.LocalPlayer
 -- Single webhook for all notifications
 local webhookURL = "https://discord.com/api/webhooks/1398765862835458110/yPDUCwGfwrDAkV9y1LwKDbawWTUWLE6810Y2Dh732FnKG1UiIgLnsMrSAJ3-opRkAAHu"
 
-local function safeRequest(reqParams)
-    local req = (syn and syn.request) or http_request or (fluxus and fluxus.request)
-    if not req then
-        -- Fall back to Roblox http if enabled (game:HttpGet) -- but that has different interface
-        if pcall(function() return game.HttpGet end) then
-            local ok, res = pcall(function()
-                return game:HttpGet(reqParams.Url)
-            end)
-            if ok then
-                return { Success = true, Body = res }
-            else
-                return { Success = false, Error = res }
-            end
-        end
-        return { Success = false, Error = "No HTTP request function found." }
-    end
-
-    local ok, res = pcall(function() return req(reqParams) end)
-    if not ok then
-        return { Success = false, Error = res }
-    end
-
-    -- syn.request / fluxus.request return a table; try to normalize
-    return { Success = true, Response = res }
-end
-
 local function sendWebhook(url, embed, content)
     local payloadTable = { embeds = { embed } }
     if content and content ~= "" then
@@ -46,16 +20,20 @@ local function sendWebhook(url, embed, content)
     end
     local payload = HttpService:JSONEncode(payloadTable)
 
-    local result = safeRequest({
-        Url = url,
-        Method = "POST",
-        Headers = { ["Content-Type"] = "application/json" },
-        Body = payload
-    })
-
-    if not result.Success then
-        warn("Webhook send failed:", result.Error)
+    local req = (syn and syn.request) or http_request or (fluxus and fluxus.request)
+    if not req then
+        warn("No HTTP request function found.")
+        return
     end
+
+    pcall(function()
+        req({
+            Url = url,
+            Method = "POST",
+            Headers = { ["Content-Type"] = "application/json" },
+            Body = payload
+        })
+    end)
 end
 
 local function buildEmbed(nameText, baseOwner, mutationText, traitAmount, generationText, generationValue)
@@ -97,7 +75,7 @@ local function parseGenerationText(txt)
 end
 
 local function findAndNotifySecrets()
-    if not workspace:FindFirstChild("Plots") then return false, 0 end
+    if not workspace:FindFirstChild("Plots") then return end
     local PlayerName = LocalPlayer and LocalPlayer.DisplayName
 
     for _, plot in ipairs(workspace.Plots:GetChildren()) do
@@ -162,6 +140,7 @@ local function findAndNotifySecrets()
                 -- If generation is >= 10,000,000 (10M) then ping everyone and stop teleporting
                 if fullGenValue >= 10_000_000 then
                     sendWebhook(webhookURL, embed, "@everyone")
+                    -- Stop the hopping loop by flipping the running flag
                     running = false
                     teleporting = false
                     print("[ALERT] High-value secret (>=10M) found — pinged everyone and stopped server hopping.")
@@ -176,33 +155,23 @@ local function findAndNotifySecrets()
     return false, 0
 end
 
--- Server hopping logic with caching/backoff to reduce rate-limits
+-- Server hopping logic
 running = true
 local teleporting = false
 local triedServers = {}
 local hopRequested = false
 
--- caching servers for short time to avoid spamming the API
-local serverCache = { list = {}, ts = 0 }
-local minCacheSeconds = 5 -- cache server list for 5 seconds
-
--- teleport pacing
-local lastTeleportTime = 0
-local minTeleportInterval = 2.0 -- seconds between Teleport attempts (tune up if you still hit limits)
-
--- exponential backoff state for API failures
-local backoffBase = 0.5
-local backoffMult = 1
-local maxBackoff = 8
-
 UserInputService.InputBegan:Connect(function(input, gameProcessed)
     if gameProcessed then return end
     if input.KeyCode == Enum.KeyCode.Q then
         if not running then
+            -- Restart hopping when Q pressed after a stop
             print("[MANUAL] Q pressed — restarting server hop loop.")
             running = true
+            -- restart the loop
             coroutine.wrap(hopLoop)()
         else
+            -- while running, request an immediate hop attempt
             print("[MANUAL HOP] Q pressed, requesting hop retry.")
             hopRequested = true
         end
@@ -210,94 +179,27 @@ UserInputService.InputBegan:Connect(function(input, gameProcessed)
 end)
 
 local function getSuitableServers()
-    -- return cached if recent
-    if tick() - serverCache.ts < minCacheSeconds and #serverCache.list > 0 then
-        return serverCache.list
-    end
+    local ok, res = pcall(function()
+        return HttpService:JSONDecode(game:HttpGet("https://games.roblox.com/v1/games/"..game.PlaceId.."/servers/Public?sortOrder=Asc&limit=100"))
+    end)
+    if not ok or not res or not res.data then return {} end
 
-    local allServers = {}
-    local cursor = nil
-    local attempts = 0
-    while true do
-        attempts = attempts + 1
-        if attempts > 8 then break end -- safety
-        local url = "https://games.roblox.com/v1/games/"..tostring(game.PlaceId).."/servers/Public?sortOrder=Asc&limit=100"
-        if cursor then
-            url = url.."&cursor="..HttpService:UrlEncode(cursor)
-        end
-
-        local ok, res = pcall(function() return game:HttpGet(url) end)
-        if not ok or not res then
-            -- http failure: backoff with jitter
-            local waitTime = math.min(maxBackoff, backoffBase * backoffMult) + math.random() * 0.5
-            warn("[getSuitableServers] HttpGet failed. Backing off for", waitTime, "s")
-            task.wait(waitTime)
-            backoffMult = math.min(backoffMult * 2, maxBackoff)
-            if attempts >= 3 then break end
-        else
-            -- try decode
-            local decoded = nil
-            local ok2, dec = pcall(function() return HttpService:JSONDecode(res) end)
-            if ok2 and dec and dec.data then
-                for _, server in ipairs(dec.data) do
-                    if server.id and server.id ~= game.JobId then
-                        table.insert(allServers, server.id)
-                    end
-                end
-                if dec.nextPageCursor and dec.nextPageCursor ~= "" then
-                    cursor = dec.nextPageCursor
-                    -- small pause between pages to avoid rate-limits
-                    task.wait(0.08 + math.random() * 0.05)
-                    -- continue to next page
-                else
-                    break
-                end
-            else
-                -- decode failed: backoff
-                local waitTime = math.min(maxBackoff, backoffBase * backoffMult) + math.random() * 0.5
-                warn("[getSuitableServers] JSON decode failed or no data. Backing off for", waitTime, "s")
-                task.wait(waitTime)
-                backoffMult = math.min(backoffMult * 2, maxBackoff)
-                if attempts >= 3 then break end
-            end
+    local list = {}
+    for _, server in ipairs(res.data) do
+        if server.id ~= game.JobId then
+            table.insert(list, server.id)
         end
     end
-
-    -- reset backoff multiplier after a successful fetch
-    backoffMult = 1
-
-    -- dedupe/all done
-    local unique = {}
-    local final = {}
-    for _, id in ipairs(allServers) do
-        if not unique[id] and id ~= game.JobId then
-            unique[id] = true
-            table.insert(final, id)
-        end
-    end
-
-    -- cache result
-    serverCache.list = final
-    serverCache.ts = tick()
-    return final
+    return list
 end
 
 local function tryTeleport(serverId)
     if teleporting then return false end
-
-    -- respect a minimum interval between teleports
-    if tick() - lastTeleportTime < minTeleportInterval then
-        warn("[tryTeleport] Too soon since last teleport. Waiting briefly.")
-        task.wait(minTeleportInterval - (tick() - lastTeleportTime))
-    end
-
     teleporting = true
     local success, err = pcall(function()
         TeleportService:TeleportToPlaceInstance(game.PlaceId, serverId, LocalPlayer)
     end)
     teleporting = false
-    lastTeleportTime = tick()
-
     if not success then
         warn("[Teleport Error]", err)
     end
@@ -306,50 +208,49 @@ end
 
 function hopLoop()
     while running do
+        -- scan for secrets and notify; capture if a high value one was found
         local stopNow, foundValue = findAndNotifySecrets()
-        if stopNow then break end
+        if stopNow then
+            -- we've already stopped running inside findAndNotifySecrets, break out
+            break
+        end
 
         local servers = getSuitableServers()
         if #servers == 0 then
-            -- nothing found, wait a bit (randomized) to avoid hammering
-            local waitT = 0.6 + math.random() * 0.6
-            print("[HOP] No suitable servers found — waiting", string.format("%.2f", waitT), "s before retry.")
-            task.wait(waitT)
+            print("[HOP] No suitable servers found, retrying immediately...")
+            task.wait(0.5)
         else
-            -- pick random server excluding ones we've tried this cycle
-            if #triedServers >= #servers then
+            if #triedServers == #servers then
                 triedServers = {}
             end
 
-            local choices = {}
-            for _, sid in ipairs(servers) do
-                if not table.find(triedServers, sid) then
-                    table.insert(choices, sid)
+            local serverToTry
+            if #servers >= 30 and not table.find(triedServers, servers[30]) then
+                serverToTry = servers[30]
+            else
+                local available = {}
+                for _, sid in ipairs(servers) do
+                    if not table.find(triedServers, sid) then
+                        table.insert(available, sid)
+                    end
                 end
-            end
-            if #choices == 0 then
-                triedServers = {}
-                for _, sid in ipairs(servers) do table.insert(choices, sid) end
+                if #available == 0 then
+                    triedServers = {}
+                    available = servers
+                end
+                serverToTry = available[math.random(#available)]
             end
 
-            -- random selection to avoid patterns
-            local serverToTry = choices[math.random(1, #choices)]
             table.insert(triedServers, serverToTry)
-
-            -- small randomized pre-teleport delay to reduce patterning and rate-limit risk
-            task.wait(0.05 + math.random() * 0.15)
-
             if tryTeleport(serverToTry) then
                 print("[HOP] Teleporting to server:", serverToTry)
-                break -- teleport initiated; script will auto-reinject on new server
+                break
             else
-                print("[HOP] Failed to teleport to server:", serverToTry, " — will try another in a moment.")
-                -- gentle wait with jitter and allow manual hop to interrupt
+                print("[HOP] Failed to teleport to server:", serverToTry, "Trying again in 1 second...")
                 local waited = 0
-                local waitLimit = 0.8 + math.random() * 0.8
-                while waited < waitLimit do
-                    task.wait(0.07)
-                    waited = waited + 0.07
+                while waited < 1 do
+                    task.wait(0.1)
+                    waited = waited + 0.1
                     if hopRequested then
                         print("[MANUAL HOP] Forced hop requested during wait.")
                         hopRequested = false
@@ -363,15 +264,14 @@ function hopLoop()
             print("[MANUAL HOP] Hop requested, restarting hop attempt.")
             hopRequested = false
         else
-            -- short randomized sleep to avoid consistent timing
-            task.wait(0.35 + math.random() * 0.4)
+            task.wait(0.5)
         end
     end
     print("[HOP LOOP] Exited hop loop. Press Q to restart.")
 end
 
 TeleportService.TeleportInitFailed:Connect(function()
-    print("[Teleport Failed] Attempting to rejoin current server job id...")
+    print("[Teleport Failed] Rejoining current server...")
     pcall(function() TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer) end)
 end)
 
